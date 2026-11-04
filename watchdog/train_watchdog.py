@@ -1,0 +1,143 @@
+"""Train the WATCHDOG (RecurrentPPO, LSTM policy) on recorded trajectories of the frozen agent pool.
+
+Usage:
+    python watchdog/dataset.py --episodes 150             # build data first
+    python watchdog/train_watchdog.py --timesteps 400000
+
+Uses only the `train` split (never SPOOFER-05, SCRIPTED-ATK or any AMZN source).
+Writes checkpoints/WATCHDOG/<tag>/model.zip and progress.csv with per-rollout step-level
+precision / recall / false-positive rate on the training data.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from sb3_contrib import RecurrentPPO  # noqa: E402
+from stable_baselines3.common.callbacks import BaseCallback  # noqa: E402
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize  # noqa: E402
+
+from watchdog.dataset import DATA_DIR, causal_labels, load_split  # noqa: E402
+from watchdog.watchdog_env import WatchdogEnv  # noqa: E402
+
+
+class DetectionLog(BaseCallback):
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path, self.t0 = path, time.time()
+        self._fh = open(path, "w", newline="")
+        self._w = None
+        self.tp = self.fp = self.fn = self.tn = 0
+        self.reward = 0.0
+
+    def _on_step(self) -> bool:
+        self.reward += float(np.sum(self.locals["rewards"]))
+        for info in self.locals["infos"]:
+            f, y = info["flag"], info["label"]
+            self.tp += f and y
+            self.fp += f and not y
+            self.fn += (not f) and y
+            self.tn += (not f) and not y
+        return True
+
+    def _on_rollout_end(self):
+        n = self.tp + self.fp + self.fn + self.tn
+        row = {
+            "timesteps": self.num_timesteps, "wall_s": round(time.time() - self.t0, 1),
+            "reward_per_step": self.reward / max(n, 1),
+            "positive_rate": (self.tp + self.fn) / max(n, 1),
+            "flag_rate": (self.tp + self.fp) / max(n, 1),
+            "precision": self.tp / (self.tp + self.fp) if self.tp + self.fp else float("nan"),
+            "recall": self.tp / (self.tp + self.fn) if self.tp + self.fn else float("nan"),
+            "fpr": self.fp / (self.fp + self.tn) if self.fp + self.tn else float("nan"),
+        }
+        if self._w is None:
+            self._w = csv.DictWriter(self._fh, fieldnames=list(row))
+            self._w.writeheader()
+        self._w.writerow(row)
+        self._fh.flush()
+        print(" ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()), flush=True)
+        self.tp = self.fp = self.fn = self.tn = 0
+        self.reward = 0.0
+
+    def _on_training_end(self):
+        self._fh.close()
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--timesteps", type=int, default=400_000)
+    p.add_argument("--tag", default="main")
+    p.add_argument("--data", default=str(DATA_DIR))
+    p.add_argument("--fp-cost", type=float, default=2.0)
+    p.add_argument("--fn-cost", type=float, default=1.0)
+    p.add_argument("--n-envs", type=int, default=4)
+    p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--threads", type=int, default=2)
+    # Entropy bonus against early collapse to "never flag" (the same fix got the Spoofers past never trading).
+    p.add_argument("--ent-coef", type=float, default=0.0)
+    # Standardise observations. Raw book price features sit near +-20 while the participant features that carry
+    # the signal are 0-5; the logistic-regression diagnostic that separated positives standardised its inputs.
+    p.add_argument("--norm-obs", action="store_true")
+    # Training label. "hindsight" (the recorded y, every step a manipulative order rests) reproduces the reported
+    # Watchdog; "causal" is positive only from the owner's first opposite trade (watchdog.dataset.causal_labels).
+    p.add_argument("--label", choices=["hindsight", "causal"], default="hindsight")
+    # Flags never change what the Watchdog observes next, so each step is a separate decision and the optimal policy
+    # is myopic; gamma > 0 only adds variance to the advantage. Default 0.9 reproduces the reported Watchdog.
+    p.add_argument("--gamma", type=float, default=0.9)
+    # Extra training sources merged into the train split, e.g. data/watchdog_ext (CP-7 round 2: VARIED-SPOOF, ACCUM)
+    p.add_argument("--extra-data", nargs="*", default=[])
+    args = p.parse_args()
+    torch.set_num_threads(args.threads)
+
+    sources = load_split("train", Path(args.data))
+    if not sources:
+        print(f"no training data in {Path(args.data) / 'train'}; run watchdog/dataset.py first")
+        return 1
+    for extra in args.extra_data:
+        more = load_split("train", Path(extra))
+        if not more:
+            print(f"no training data in {Path(extra) / 'train'}")
+            return 1
+        sources.update(more)
+    if args.label == "causal":
+        sources = {n: {**s, "y": causal_labels(s)} for n, s in sources.items()}
+    for name, s in sources.items():
+        print(f"train source {name:18s} steps={len(s['y']):7d} positive={s['y'].mean():.3f}")
+
+    def factory(rank):
+        def _make():
+            env = WatchdogEnv(sources, fn_cost=args.fn_cost, fp_cost=args.fp_cost)
+            env.reset(seed=args.seed + rank)
+            return env
+        return _make
+
+    vec = DummyVecEnv([factory(i) for i in range(args.n_envs)])
+    if args.norm_obs:
+        vec = VecNormalize(vec, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    out = ROOT / "checkpoints" / "WATCHDOG" / args.tag
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "config.txt").write_text(f"{vars(args)}\nsources={sorted(sources)}\n")
+
+    model = RecurrentPPO("MlpLstmPolicy", vec, learning_rate=3e-4, n_steps=512, batch_size=512, n_epochs=5,
+                         gamma=args.gamma, ent_coef=args.ent_coef, policy_kwargs=dict(lstm_hidden_size=64, net_arch=[128]),
+                         seed=args.seed, verbose=0, device="cpu")
+    model.learn(total_timesteps=args.timesteps, callback=DetectionLog(out / "progress.csv"))
+    model.save(out / "model")
+    if args.norm_obs:
+        vec.save(str(out / "vecnormalize.pkl"))  # evaluation must apply the same observation scaling
+    print(f"saved {out / 'model.zip'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

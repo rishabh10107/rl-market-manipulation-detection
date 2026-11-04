@@ -1,0 +1,216 @@
+"""Build and load Watchdog datasets from frozen agents.
+
+The Spoofer pool is frozen before the Watchdog trains (no co-evolution). Every source policy is rolled
+out once in LimitOrderBookEnv and its surveillance view is saved, so Watchdog training replays fixed
+trajectories and cannot influence the agents it watches.
+
+Splits:
+  train    SPOOFER-01..04 on their own stocks, HONEST and FLICKER on AAPL/MSFT/GOOG/INTC
+  test     the same sources with different seeds (in-distribution check)
+  heldout  never used for training: SPOOFER-05 (AMZN), SCRIPTED-ATK on all stocks,
+           HONEST and FLICKER on AMZN
+
+Usage:
+    python watchdog/dataset.py --episodes 30 [--tag main]
+Writes data/watchdog/<split>/<SOURCE>_<TICKER>.npz
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import zlib
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "training"))
+
+from env.lob_env import EnvConfig, LimitOrderBookEnv  # noqa: E402
+from env.lobster_data import load_day  # noqa: E402
+from env.normalization import reference_stats  # noqa: E402
+from evaluation.agents import Accumulator, Flicker, Honest, ModelPolicy, ScriptedSpoof, VariedSpoof  # noqa: E402
+from evaluation.baseline_detector import OrderRecord  # noqa: E402
+from evaluation.rollout import OBS_DIM, record_episode  # noqa: E402
+
+DATA_DIR = ROOT / "data" / "watchdog"
+# Disjoint stretches of the trading day per split, as fractions of the usable range (after the warmup).
+# Without this the splits shared market data: 33 of 50 test episodes overlapped a training episode.
+TIME_SPLIT = {"train": (0.0, 0.60), "test": (0.60, 0.80), "heldout": (0.80, 1.0)}
+# CP-7 round 2: training-only scripted sources kept apart, so the original splits and every result built on them
+# are unchanged (python watchdog/dataset.py --extended)
+EXT_DATA_DIR = ROOT / "data" / "watchdog_ext"
+TRAIN_TICKERS = ["AAPL", "MSFT", "GOOG", "INTC"]
+TICKERS = ["AAPL", "MSFT", "GOOG", "INTC", "AMZN"]
+HELD_OUT = "AMZN"
+SEED_BASE = {"train": 100_000, "test": 200_000, "heldout": 300_000}
+REMOVED = {"cancel": 0, "run_over": 1, "episode_end": 2}
+REMOVED_INV = {v: k for k, v in REMOVED.items()}
+ORDER_COLS = ["episode", "order_id", "side", "size", "depth_mult", "placed", "removed", "removed_by",
+              "opposite_trades", "events_per_step"]
+
+
+@dataclass
+class Source:
+    name: str
+    ticker: str
+    make_policy: object
+    cfg: dict
+
+
+def sources(tag: str = "main") -> dict[str, list[Source]]:
+    from train_spoofer import AGENTS, DECISION_ENV
+    train, heldout = [], []
+    for agent, spec in AGENTS.items():
+        path = ROOT / "checkpoints" / agent / tag / "model.zip"
+        if not path.exists():
+            print(f"[skip] {agent}: no checkpoint at {path.relative_to(ROOT)}")
+            continue
+        # sampled actions: with argmax, SPOOFER-02 (MSFT) lost its learned spoofing (-$1,291/episode, no spoof
+        # gain) while sampling gave +$2,085 with +$7,664 spoof gain
+        src = Source(agent, spec["ticker"], lambda p=path: ModelPolicy(p, deterministic=False), spec["cfg"])
+        (heldout if spec["ticker"] == HELD_OUT else train).append(src)
+    for tk in TICKERS:
+        bucket = heldout if tk == HELD_OUT else train
+        # controls share the Spoofers' decision granularity, so every source has the same step size
+        bucket.append(Source("HONEST", tk, Honest, DECISION_ENV))
+        bucket.append(Source("FLICKER", tk, Flicker, DECISION_ENV))
+        heldout.append(Source("SCRIPTED-ATK", tk, ScriptedSpoof, DECISION_ENV))
+    return {"train": train, "test": train, "heldout": heldout}
+
+
+def extended_sources() -> dict[str, list[Source]]:
+    """VARIED-SPOOF and ACCUM on the four training stocks (never AMZN), train and test splits only."""
+    from train_spoofer import DECISION_ENV
+    srcs = [Source(name, tk, make, DECISION_ENV) for tk in TRAIN_TICKERS
+            for name, make in (("VARIED-SPOOF", VariedSpoof), ("ACCUM", Accumulator))]
+    return {"train": srcs, "test": srcs}
+
+
+def _orders_to_array(orders_by_ep: list[list[OrderRecord]]) -> np.ndarray:
+    rows = [[ep, o.order_id, o.side, o.size, o.depth_mult, o.placed_step, o.removed_step,
+             REMOVED[o.removed_by], o.opposite_trades, o.events_per_step]
+            for ep, orders in enumerate(orders_by_ep) for o in orders]
+    return np.asarray(rows, dtype=np.float64).reshape(-1, len(ORDER_COLS))
+
+
+def orders_from_array(arr: np.ndarray) -> list[tuple[int, OrderRecord]]:
+    """-> [(episode, OrderRecord)]"""
+    out = []
+    for r in arr:
+        rec = OrderRecord(int(r[1]), int(r[2]), float(r[3]), float(r[4]), int(r[5]), int(r[6]),
+                          REMOVED_INV[int(r[7])], int(r[8]), int(r[9]) if len(r) > 9 else 1)
+        out.append((int(r[0]), rec))
+    return out
+
+
+def split_window(day_len: int, split: str, warmup: int = 30_000) -> dict:
+    """Episode-start window for a split, so train / test / heldout use disjoint parts of the day."""
+    if split not in TIME_SPLIT:
+        return {}
+    lo_f, hi_f = TIME_SPLIT[split]
+    usable = day_len - warmup
+    return {"start_min": int(warmup + lo_f * usable), "start_max": int(warmup + hi_f * usable)}
+
+
+def build_source(src: Source, split: str, episodes: int, cache: dict, time_split: bool = False) -> dict:
+    if src.ticker not in cache:
+        d = load_day(src.ticker)
+        cache[src.ticker] = (d, reference_stats(d))
+    d, s = cache[src.ticker]
+    cfg = dict(src.cfg)
+    if time_split:
+        cfg.update(split_window(len(d), split))
+    env = LimitOrderBookEnv(EnvConfig(ticker=src.ticker, **cfg), day=d, stats=s)
+    policy = src.make_policy()
+    salt = zlib.crc32(f"{src.name}/{src.ticker}".encode()) % 10_000
+    rng = np.random.default_rng(SEED_BASE[split] + salt)
+    import torch
+    torch.manual_seed(SEED_BASE[split] + salt)  # reproducible action sampling for trained Spoofers
+    eps = [record_episode(env, policy, rng, seed=SEED_BASE[split] + salt * 7 + 97 * j) for j in range(episodes)]
+    lengths = np.array([len(e["y"]) for e in eps])
+    return {
+        "X": np.concatenate([e["X"] for e in eps]),
+        "y": np.concatenate([e["y"] for e in eps]),
+        "ep_offsets": np.concatenate([[0], np.cumsum(lengths)]),
+        "orders": _orders_to_array([e["orders"] for e in eps]),
+        "pnl": np.array([e["pnl"] for e in eps]),
+    }
+
+
+TRADE_COL = 40 + 4  # participant feature "trade direction this step" (evaluation/rollout.py)
+
+
+def causal_labels(src: dict) -> np.ndarray:
+    """Per-step labels that only become positive once the evidence exists: from the first step on which the owner
+    traded on the side opposite a resting manipulative order, until that order is removed.
+
+    The recorded label `y` is set with hindsight over the order's whole resting window, including steps before any
+    opposite trade. Training on it rewarded predicting which trader will spoof (the Watchdog flagged 99% of
+    SPOOFER-04's orders before any opposite trade) rather than detecting the act (it flagged 13.7% of SPOOFER-03's
+    opposite-trade steps); see scripts/flag_timing_diagnostic.py. Every causal positive is also a hindsight positive.
+    """
+    y = np.zeros(len(src["y"]), dtype=bool)
+    off = src["ep_offsets"]
+    for ep, o in orders_from_array(src["orders"]):
+        if not o.manipulative:
+            continue
+        a = off[ep]
+        trades = src["X"][a + o.placed_step:a + o.removed_step, TRADE_COL]
+        hit = np.flatnonzero(trades == -o.side)
+        if hit.size:
+            y[a + o.placed_step + hit[0]:a + o.removed_step] = True
+    return y
+
+
+def load_split(split: str, data_dir: Path = DATA_DIR) -> dict[str, dict]:
+    """-> {"SOURCE_TICKER": {"X", "y", "ep_offsets", "orders", "pnl"}}"""
+    out = {}
+    for f in sorted((data_dir / split).glob("*.npz")):
+        with np.load(f) as z:
+            out[f.stem] = {k: z[k] for k in z.files}
+    return out
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    # Episodes are 200 agent steps (2,000 events at 10 events/step), so 150 train episodes give each source
+    # ~30,000 Watchdog steps. Test/heldout use a third (min 10).
+    p.add_argument("--episodes", type=int, default=150, help="train episodes per source; test/heldout use a third (min 10)")
+    p.add_argument("--eval-episodes", type=int, default=None, help="override test/heldout episodes per source")
+    p.add_argument("--tag", default="main")
+    p.add_argument("--splits", nargs="*", default=["train", "test", "heldout"])
+    p.add_argument("--out", default=None)
+    p.add_argument("--extended", action="store_true", help="build the CP-7 round-2 training-only sources instead")
+    p.add_argument("--time-split", action="store_true",
+                   help="give train / test / heldout disjoint stretches of the trading day")
+    args = p.parse_args()
+    if args.out is None:
+        args.out = str(EXT_DATA_DIR if args.extended else DATA_DIR)
+    if args.extended:
+        args.splits = [s for s in args.splits if s != "heldout"]
+
+    t0, cache = time.time(), {}
+    by_split = extended_sources() if args.extended else sources(args.tag)
+    for split in args.splits:
+        if split == "train":
+            n = args.episodes
+        else:
+            n = args.eval_episodes if args.eval_episodes is not None else max(10, args.episodes // 3)
+        out_dir = Path(args.out) / split
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for src in by_split[split]:
+            data = build_source(src, split, n, cache, time_split=args.time_split)
+            np.savez_compressed(out_dir / f"{src.name}_{src.ticker}.npz", **data)
+            assert data["X"].shape[1] == OBS_DIM
+            print(f"[{time.time() - t0:6.0f}s] {split:7s} {src.name:12s} {src.ticker} episodes={n} "
+                  f"steps={len(data['y'])} positive_steps={data['y'].mean():.3f} orders={len(data['orders'])}",
+                  flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

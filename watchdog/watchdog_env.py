@@ -1,0 +1,121 @@
+"""WatchdogEnv — the detector's RL environment.
+
+The Watchdog watches one participant's recorded episode step by step (46-dim surveillance
+observation, see evaluation/rollout.py) and chooses 0 = clear or 1 = flag.
+
+Reward per step (asymmetric: a false accusation costs more than a miss, per the design):
+    flag while a manipulative order rests      +tp_reward   (default +1)
+    clear while a manipulative order rests     -fn_cost     (default -1)
+    flag when nothing manipulative rests       -fp_cost     (default -2)
+    clear when nothing manipulative rests       0
+
+The Watchdog is never told the rule "large order + opposite trade + cancel"; it only receives these
+rewards. Episodes are sampled source-first (each SOURCE_TICKER equally likely), so sources that rarely
+spoof are not drowned out by long clean episodes.
+"""
+from __future__ import annotations
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+from evaluation.rollout import OBS_DIM
+
+OBS_BOUND = 25.0
+
+
+class WatchdogEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(self, sources: dict[str, dict], tp_reward: float = 1.0, fn_cost: float = 1.0,
+                 fp_cost: float = 2.0):
+        super().__init__()
+        if not sources:
+            raise ValueError("no sources given")
+        self.tp_reward, self.fn_cost, self.fp_cost = tp_reward, fn_cost, fp_cost
+        self.names = sorted(sources)
+        self.episodes = {}
+        for name in self.names:
+            src = sources[name]
+            off = src["ep_offsets"]
+            self.episodes[name] = [(src["X"][a:b], src["y"][a:b]) for a, b in zip(off[:-1], off[1:]) if b > a]
+        self.observation_space = spaces.Box(-OBS_BOUND, OBS_BOUND, shape=(OBS_DIM,), dtype=np.float32)
+        self.action_space = spaces.Discrete(2)
+
+    def _obs(self) -> np.ndarray:
+        return np.clip(self.X[self.i], -OBS_BOUND, OBS_BOUND).astype(np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        options = options or {}
+        self.source = options.get("source", self.names[int(self.np_random.integers(len(self.names)))])
+        eps = self.episodes[self.source]
+        k = int(options.get("episode", self.np_random.integers(len(eps))))
+        self.X, self.y = eps[k]
+        self.i = 0
+        return self._obs(), {"source": self.source}
+
+    def step(self, action):
+        flag, label = int(action) == 1, bool(self.y[self.i])
+        if label:
+            reward = self.tp_reward if flag else -self.fn_cost
+        else:
+            reward = -self.fp_cost if flag else 0.0
+        info = {"label": label, "flag": flag, "source": self.source}
+        self.i += 1
+        truncated = self.i >= len(self.y)
+        if truncated:
+            self.i = len(self.y) - 1
+        return self._obs(), float(reward), False, truncated, info
+
+
+def load_obs_norm(folder) -> dict | None:
+    """Observation-normalisation statistics saved by train_watchdog.py --norm-obs, or None."""
+    import pickle
+    from pathlib import Path
+    f = Path(folder) / "vecnormalize.pkl"
+    if not f.exists():
+        return None
+    with open(f, "rb") as fh:
+        vn = pickle.load(fh)
+    return {"mean": vn.obs_rms.mean.astype(np.float32), "var": vn.obs_rms.var.astype(np.float32),
+            "epsilon": float(vn.epsilon), "clip": float(vn.clip_obs)}
+
+
+def prepare_obs(X: np.ndarray, obs_norm: dict | None = None) -> np.ndarray:
+    """The scaling the Watchdog saw in training: env clip first, then VecNormalize standardise and clip."""
+    X = np.clip(X, -OBS_BOUND, OBS_BOUND).astype(np.float32)
+    if obs_norm is not None:
+        X = np.clip((X - obs_norm["mean"]) / np.sqrt(obs_norm["var"] + obs_norm["epsilon"]),
+                    -obs_norm["clip"], obs_norm["clip"]).astype(np.float32)
+    return X
+
+
+class OnlineWatchdog:
+    """A trained Watchdog acting inside a live episode: one observation per step, recurrent state carried."""
+
+    def __init__(self, model, obs_norm: dict | None = None):
+        self.model, self.obs_norm = model, obs_norm
+        self.reset()
+
+    def reset(self) -> None:
+        self.state, self.start = None, np.ones((1,), dtype=bool)
+
+    def flag(self, x: np.ndarray) -> bool:
+        obs = prepare_obs(x[None], self.obs_norm)
+        action, self.state = self.model.predict(obs, state=self.state, episode_start=self.start, deterministic=True)
+        self.start = np.zeros((1,), dtype=bool)
+        return int(np.asarray(action).reshape(-1)[0]) == 1
+
+
+def flag_episode(model, X: np.ndarray, obs_norm: dict | None = None) -> np.ndarray:
+    """Run a (recurrent) policy deterministically over one recorded episode; returns per-step flags.
+    `obs_norm` applies the same scaling VecNormalize used in training (env clip first, then standardise)."""
+    X = prepare_obs(X, obs_norm)
+    state, start = None, np.ones((1,), dtype=bool)
+    flags = np.zeros(len(X), dtype=bool)
+    for i in range(len(X)):
+        action, state = model.predict(X[i][None], state=state, episode_start=start, deterministic=True)
+        start = np.zeros((1,), dtype=bool)
+        flags[i] = int(np.asarray(action).reshape(-1)[0]) == 1
+    return flags
