@@ -29,7 +29,7 @@ SpoofWatch asks: **can a learned detector, trained against agents that discover 
 | Finding | Result |
 |---|---|
 | **Manipulation emerges on its own** | Profit-only agents learned to spoof on narrow-spread stocks: **+$14,368 ± 1,135** per episode on INTC across 3 training seeds. With price impact switched off, the same trading **loses** about $8k, so the profit comes from the manipulation itself. |
-| **Far fewer false accusations** | The first Watchdog flagged **3.1%** of legitimate orders against the rule's **82.3%**, about 26× fewer false alarms. |
+| **Far fewer false accusations** | The first Watchdog flagged **3.1%** of legitimate orders against the rule's **82.3%** (mean of 3 seeds), about 26× fewer false alarms. The final model brought this down to **0.2%**. |
 | **A labelling bug, found and fixed** | It initially missed unseen attacks (recall 0.22–0.30). Diagnosis showed the label taught it to predict *who* would spoof, not the *act*. After fixing the label, held-out recall rose to **0.98–0.99** at a false-positive rate of **0.001–0.012** across four attack families. |
 | **Surveillance that stops the profit** | Acting inside episodes, the fixed Watchdog cut the INTC spoofer's profit by **101%** (turning it into a loss), against **55%** for the rule. |
 | **An honest limit** | An audit showed two of the detector's own input features reveal the label: a **zero-parameter rule scores F1 0.997**. The detection task as posed is close to a tautology, so the real contribution is the attacker side and the labelling lesson, not "RL solves surveillance". Spoofing profit also does not survive the synthetic market. |
@@ -58,7 +58,33 @@ pip install -r requirements-dashboard.txt
 streamlit run app.py --server.fileWatcherType none
 ```
 
-All trained models are included in `checkpoints/`, so every evaluation can be reproduced without retraining. The full command list is in the technical manual.
+All trained models are included in `checkpoints/`, so the headline results can be reproduced without retraining:
+
+```bash
+python evaluation/basic_eval.py --episodes 20    # spoofer profit and behaviour
+python watchdog/dataset.py --episodes 150        # build the detection dataset
+python watchdog/evaluate_watchdog.py             # Watchdog vs the rule
+python scripts/label_observability.py            # the audit: how hard is the task really?
+```
+
+The full command list is in the technical manual.
+
+![Replay of a spoofing episode with the Watchdog's decisions](docs/screenshots/02_demonstration_full.jpg)
+
+## Project structure
+
+```
+env/          Gymnasium limit-order-book environment (LOBSTER replay + price-impact model)
+training/     PPO training for the Spoofer agents
+watchdog/     dataset building, RecurrentPPO detector training, evaluation, pre-registered tests
+evaluation/   rule-based baseline detector and agent evaluation
+synthetic/    agent-based synthetic market for the robustness test
+scripts/      calibration, audits, figures, dashboard and PDF builders
+checkpoints/  every trained model, ready to evaluate
+results/      every reported number, as JSON and Markdown, plus figures
+tests/        214-test suite, including checks that documented numbers match results
+app.py        Streamlit console
+```
 
 ## Documentation
 
@@ -71,7 +97,8 @@ All trained models are included in `checkpoints/`, so every evaluation can be re
 | [`docs/MODEL_COMPARISON.md`](docs/MODEL_COMPARISON.md) | Every detector compared on the same data |
 | [`docs/FEATURE_DICTIONARY.md`](docs/FEATURE_DICTIONARY.md) | Every input feature and whether it leaks the label |
 | [`docs/EXPERIMENT_PROTOCOL.md`](docs/EXPERIMENT_PROTOCOL.md) | Hypotheses, splits, seeds and pre-registration rules |
-| [`dashboard.html`](dashboard.html) | One-page static summary of all results |
+| [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md) | 10-minute walkthrough script for presenting the project |
+| [`dashboard.html`](dashboard.html) | One-page static summary of all results (download and open in a browser) |
 
 ## Scope
 
